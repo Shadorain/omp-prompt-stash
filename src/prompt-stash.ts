@@ -10,14 +10,30 @@ import { basename, dirname, join, resolve } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
-  Theme,
+  ExtensionTheme as Theme,
+  KeybindingsManager,
 } from "@oh-my-pi/pi-coding-agent";
-import { getAgentDir, getPluginsLockfile } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getPluginsLockfile } from "@oh-my-pi/pi-utils/dirs";
 import {
-  extractPrintableText,
-  matchesKey as matchesTuiKey,
-} from "@oh-my-pi/pi-tui";
-import type { KeyId, TUI } from "@oh-my-pi/pi-tui";
+  truncate as truncateToWidth,
+  visibleWidth,
+} from "@oh-my-pi/pi-tui/text/width";
+import { decodeKey } from "@oh-my-pi/pi-tui/driver/input/keys";
+
+type PopupUi = {
+  requestRender(): void;
+  suspend<R>(run: () => Promise<R>): Promise<R>;
+};
+function inputKeyId(data: string): string | undefined {
+  const key = decodeKey(data, { kitty: true, backspaceIsCtrl: false });
+  return key && key.kind !== "release" ? key.id.toLowerCase() : undefined;
+}
+
+function printableText(data: string): string {
+  const key = decodeKey(data, { kitty: true, backspaceIsCtrl: false });
+  if (key) return key.kind === "release" ? "" : key.text ?? "";
+  return !data.includes("\x1b") && !/[\p{C}]/u.test(data) ? data : "";
+}
 
 const PACKAGE_ID = "omp-prompt-stash";
 const DEFAULT_STORE_FILE = "prompt-stash.json";
@@ -325,65 +341,6 @@ function stashPrompt(
   return items.length;
 }
 
-function stripAnsi(text: string): string {
-  return text
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b_pi:[^\x07]*\x07/g, "");
-}
-
-function takeEscapeSequence(text: string, index: number): string | undefined {
-  if (text.charCodeAt(index) !== 0x1b) return undefined;
-  const next = text[index + 1];
-  if (next === "[") {
-    let end = index + 2;
-    while (end < text.length && !/[@-~]/.test(text[end])) end += 1;
-    return text.slice(index, Math.min(text.length, end + 1));
-  }
-  if (next === "]") {
-    const bel = text.indexOf("\x07", index + 2);
-    const st = text.indexOf("\x1b\\", index + 2);
-    const end = bel === -1 ? st : st === -1 ? bel : Math.min(bel, st);
-    return end === -1
-      ? text.slice(index)
-      : text.slice(index, end + (end === st ? 2 : 1));
-  }
-  return text.slice(index, Math.min(text.length, index + 2));
-}
-
-function visibleWidth(text: string): number {
-  return Array.from(stripAnsi(text)).length;
-}
-
-function truncateToWidth(
-  text: string,
-  width: number,
-  ellipsis = ELLIPSIS,
-): string {
-  if (width <= 0) return "";
-  if (visibleWidth(text) <= width) return text;
-  const suffixWidth = visibleWidth(ellipsis);
-  const budget = Math.max(0, width - suffixWidth);
-  let out = "";
-  let used = 0;
-  for (let i = 0; i < text.length;) {
-    if (text.charCodeAt(i) === 0x1b) {
-      const sequence = takeEscapeSequence(text, i);
-      if (sequence) {
-        out += sequence;
-        i += sequence.length;
-        continue;
-      }
-    }
-    const char = Array.from(text.slice(i))[0];
-    if (!char) break;
-    if (used + 1 > budget) break;
-    out += char;
-    used += 1;
-    i += char.length;
-  }
-  return `${out}${ellipsis}`;
-}
 
 function padAnsi(text: string, width: number): string {
   const truncated = truncateToWidth(text, width, "");
@@ -464,16 +421,8 @@ function filterItems(items: StashItem[], query: string): StashItem[] {
 }
 
 function matchesKey(data: string, key: string): boolean {
-  const normalized = key.toLowerCase();
-  const keyId =
-    normalized === "del"
-      ? "delete"
-      : normalized === "pageup"
-        ? "pageUp"
-        : normalized === "pagedown"
-          ? "pageDown"
-          : normalized;
-  return matchesTuiKey(data, keyId as KeyId);
+  const normalized = key.toLowerCase().replace(/^del$/, "delete");
+  return inputKeyId(data) === normalized;
 }
 
 function matchesAnyShortcut(
@@ -499,34 +448,30 @@ function shortcutHint(shortcuts: readonly string[]): string | undefined {
     : undefined;
 }
 
-function handleSuspend(tui: TUI): void {
+async function handleSuspend(ui: PopupUi): Promise<void> {
   if (process.platform === "win32") return;
-  const onResume = (): void => {
-    tui.start();
-    tui.requestRender(true);
-  };
-  process.once("SIGCONT", onResume);
-  tui.stop();
-  try {
-    process.kill(0, "SIGTSTP");
-  } catch {
-    process.removeListener("SIGCONT", onResume);
-    tui.start();
-    tui.requestRender(true);
-  }
-}
-
-interface PopupKeybindings {
-  matches?(data: string, action: "app.display.reset" | "app.suspend"): boolean;
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const onResume = (): void => resolve();
+  await ui.suspend(async () => {
+    process.once("SIGCONT", onResume);
+    try {
+      process.kill(0, "SIGTSTP");
+    } catch {
+      process.removeListener("SIGCONT", onResume);
+      resolve();
+    }
+    await promise;
+  });
+  ui.requestRender();
 }
 
 function matchesAction(
-  keybindings: PopupKeybindings,
+  keybindings: KeybindingsManager,
   data: string,
   action: "app.display.reset" | "app.suspend",
-  fallback: string,
 ): boolean {
-  return keybindings.matches?.(data, action) ?? matchesKey(data, fallback);
+  const key = decodeKey(data, { kitty: true, backspaceIsCtrl: false });
+  return key !== null && keybindings.matches(key, action);
 }
 
 function renderSearchLine(query: string, width: number, theme: Theme): string {
@@ -548,7 +493,7 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
   }
 
   const restored = await ctx.ui.custom<string | null>(
-    (tui, theme, keybindings, done) => {
+    (ui, theme, keybindings, done) => {
       let query = "";
       let selected = 0;
       let scroll = 0;
@@ -579,7 +524,7 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
         items = items.filter((candidate) => candidate.id !== item.id);
         saveItems(path, items);
         clampSelection();
-        tui.requestRender();
+        ui.requestRender();
       };
 
       const clearAll = () => {
@@ -587,7 +532,7 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
         saveItems(path, items);
         confirmDeleteAll = false;
         clampSelection();
-        tui.requestRender();
+        ui.requestRender();
       };
 
       const restoreSelected = () => {
@@ -711,13 +656,12 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
           focused = value;
         },
         handleInput(data: string) {
-          if (matchesAction(keybindings, data, "app.display.reset", "alt+l")) {
-            tui.resetDisplay();
-            tui.requestRender(true);
+          if (matchesAction(keybindings, data, "app.display.reset")) {
+            ui.requestRender();
             return;
           }
-          if (matchesAction(keybindings, data, "app.suspend", "ctrl+z")) {
-            handleSuspend(tui);
+          if (matchesAction(keybindings, data, "app.suspend")) {
+            void handleSuspend(ui);
             return;
           }
 
@@ -728,7 +672,7 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
             }
             if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
               confirmDeleteAll = false;
-              tui.requestRender();
+              ui.requestRender();
               return;
             }
           }
@@ -744,25 +688,25 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
           if (matchesKey(data, "up")) {
             selected -= 1;
             clampSelection();
-            tui.requestRender();
+            ui.requestRender();
             return;
           }
           if (matchesKey(data, "down")) {
             selected += 1;
             clampSelection();
-            tui.requestRender();
+            ui.requestRender();
             return;
           }
           if (matchesKey(data, "-") || matchesKey(data, "pageUp")) {
             selected -= settings.listRows;
             clampSelection();
-            tui.requestRender();
+            ui.requestRender();
             return;
           }
           if (matchesKey(data, "=") || matchesKey(data, "pageDown")) {
             selected += settings.listRows;
             clampSelection();
-            tui.requestRender();
+            ui.requestRender();
             return;
           }
           if (matchesAnyShortcut(data, settings.deleteShortcuts)) {
@@ -771,29 +715,29 @@ async function openStashPopup(ctx: ExtensionContext): Promise<void> {
           }
           if (matchesAnyShortcut(data, settings.deleteAllShortcuts)) {
             confirmDeleteAll = items.length > 0;
-            tui.requestRender();
+            ui.requestRender();
             return;
           }
           if (matchesKey(data, "ctrl+u")) {
             query = "";
             selected = 0;
             clampSelection();
-            tui.requestRender();
+            ui.requestRender();
             return;
           }
           if (matchesKey(data, "backspace")) {
             query = query.slice(0, -1);
             selected = 0;
             clampSelection();
-            tui.requestRender();
+            ui.requestRender();
             return;
           }
-          const printableText = extractPrintableText(data);
-          if (printableText) {
-            query += printableText;
+          const text = printableText(data);
+          if (text) {
+            query += text;
             selected = 0;
             clampSelection();
-            tui.requestRender();
+            ui.requestRender();
           }
         },
         invalidate() {},
@@ -832,10 +776,13 @@ async function toggleStash(ctx: ExtensionContext): Promise<void> {
 export default function promptStash(pi: ExtensionAPI): void {
   const initialSettings = settingsFor(process.cwd());
   if (initialSettings.shortcut !== "none") {
-    pi.registerShortcut(initialSettings.shortcut as KeyId, {
-      description: "Stash current prompt or restore from prompt stash",
-      handler: async (ctx) => toggleStash(ctx),
-    });
+    pi.registerShortcut(
+      initialSettings.shortcut as Parameters<typeof pi.registerShortcut>[0],
+      {
+        description: "Stash current prompt or restore from prompt stash",
+        handler: async (ctx) => toggleStash(ctx),
+      },
+    );
   }
 
   pi.registerCommand("prompt-stash", {

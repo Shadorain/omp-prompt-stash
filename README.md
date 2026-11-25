@@ -4,7 +4,9 @@
 
 ## Requirements
 
-- [Oh My Pi](https://github.com/can1357/oh-my-pi) 17.2.9 or later
+- [Oh My Pi](https://github.com/can1357/oh-my-pi) 19.2.1 or later
+
+This release targets OMP 19.2.1's extension APIs and popup UI. It uses supported utility subpaths, OMP's keyboard decoder, and the custom UI's `requestRender`, `size`, and `suspend` methods rather than removed root exports or terminal lifecycle methods.
 
 ## Install
 
@@ -13,6 +15,8 @@ Install the public plugin:
 ```sh
 omp plugin install github:anatoli-tsinovoy/omp-prompt-stash
 ```
+
+For a patched checkout, run `omp plugin link .` from its repository root instead. The linked source remains active while an upstream pull request is pending; reinstall the public plugin only when you explicitly want to switch back.
 
 Start a new OMP session after installing or changing the global shortcut.
 
@@ -130,6 +134,8 @@ Reinstall from GitHub to update the plugin:
 ```sh
 omp plugin install github:anatoli-tsinovoy/omp-prompt-stash
 ```
+
+Installing or updating the package replaces its installed source. Local edits made directly under `~/.omp/plugins/node_modules/omp-prompt-stash/` are temporary; use a linked checkout for durable changes.
 
 Remove the plugin:
 

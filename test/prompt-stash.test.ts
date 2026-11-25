@@ -10,9 +10,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { getPluginsLockfile } from "@oh-my-pi/pi-utils";
-import { setKittyProtocolActive } from "@oh-my-pi/pi-tui";
+import { getPluginsLockfile } from "@oh-my-pi/pi-utils/dirs";
 import promptStash from "../src/prompt-stash";
+import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings/keybindings";
 
 type StoredItem = { id: string; text: string; createdAt: string };
 type StoredStore = {
@@ -33,13 +33,12 @@ type Theme = {
   bg(name: string, text: string): string;
   bold(text: string): string;
 };
-type Tui = {
-  requestRender(force?: boolean): void;
-  resetDisplay(): void;
-  stop(): void;
-  start(): void;
+type PopupUi = {
+  requestRender(): void;
+  size(): { columns: number; rows: number };
+  suspend<R>(run: () => Promise<R>): Promise<R>;
 };
-type Keybindings = { matches(data: string, keybinding: string): boolean };
+type Keybindings = Pick<KeybindingsManager, "matches">;
 type Context = {
   cwd: string;
   hasUI: boolean;
@@ -96,16 +95,15 @@ class FakeUi {
   readonly renders: string[][] = [];
   private readonly inputs: string[];
   private active: Component | undefined;
-  private readonly tui: Tui;
+  private readonly ui: PopupUi;
 
   constructor(editor = "", inputs: string[] = []) {
     this.editor = editor;
     this.inputs = inputs;
-    this.tui = {
+    this.ui = {
       requestRender: () => this.captureRender(),
-      resetDisplay: () => this.captureRender(),
-      stop: () => {},
-      start: () => {},
+      size: () => ({ columns: 120, rows: 40 }),
+      suspend: (run) => run(),
     };
   }
 
@@ -123,7 +121,7 @@ class FakeUi {
 
   custom<T>(
     factory: (
-      tui: Tui,
+      ui: PopupUi,
       theme: Theme,
       keybindings: Keybindings,
       done: (result: T) => void,
@@ -136,9 +134,9 @@ class FakeUi {
     });
     this.overlays.push(options?.overlay === true);
     this.active = factory(
-      this.tui,
+      this.ui,
       plainTheme,
-      { matches: (data, key) => data === key },
+      KeybindingsManager.inMemory(),
       resolveResult,
     );
     this.captureRender();
@@ -270,7 +268,6 @@ function command(api: FakeApi): Command {
 }
 
 beforeEach(() => {
-  setKittyProtocolActive(false);
   Object.assign(environmentBeforeTest, process.env);
   cwdBeforeTest = process.cwd();
   const root = mkdtempSync(join(tmpdir(), "omp-prompt-stash-test-"));
@@ -287,7 +284,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  setKittyProtocolActive(false);
   if (process.cwd() !== cwdBeforeTest) process.chdir(cwdBeforeTest);
   restoreEnvironment();
   rmSync(fixture.root, { recursive: true, force: true });
@@ -562,7 +558,6 @@ describe("prompt stash extension factory", () => {
   });
 
   test("navigates and restores with Kitty CSI-u input", async () => {
-    setKittyProtocolActive(true);
     writeStore(storePath("kitty-navigation"), [
       item("new", "newest", "2025-01-02T00:00:00.000Z"),
       item("old", "oldest", "2025-01-01T00:00:00.000Z"),
